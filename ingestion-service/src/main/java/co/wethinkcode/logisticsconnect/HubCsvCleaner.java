@@ -19,11 +19,15 @@ import java.util.logging.Logger;
  *
  * Whitespace rules (applied to headers AND values):
  *   - Leading/trailing padding trimmed.
- *   - Any internal run of whitespace (space, tab, newline, non-breaking space, etc.)
+ *   - Any internal run of whitespace (ASCII or Unicode, incl. NBSP, tabs, newlines)
  *     collapsed to a single ASCII space.
  *   - Whitespace-only cells become null.
  *
  * Boolean-ish flags on is_*/has_*/*active*/*_flag columns -> "true"/"false".
+        *
+        * Date-like columns (date, *_at, *_on, timestamp, created/updated/modified) are
+ * normalized to ISO-8601 via DateNormalizer. No-op on the current CSV (no date
+ * columns); the rule is wired so future extensions are handled automatically.
         */
         final class HubCsvCleaner {
 
@@ -126,12 +130,16 @@ import java.util.logging.Logger;
                 if (isProvinceColumn(header))    return canonicalProvince(v);
                 if (isStatusOrCategory(header))  return v.toLowerCase(Locale.ROOT).replaceAll("\\s+", "_");
                 if (isBooleanColumn(header))     { String b = asBoolean(v); if (b != null) return b; }
+                if (DateNormalizer.isDateColumn(header)) {
+                    String d = DateNormalizer.normalize(v);
+                    if (d != null) return d;
+                }
                 return v;
             }
 
             /**
              * Trims padding and collapses any internal run of whitespace (ASCII or Unicode,
-             * including NBSP and tabs/newlines) to a single ASCII space.
+             * including NBSP, tabs and newlines) to a single ASCII space.
              */
             static String collapseWhitespace(String raw) {
                 if (raw == null) return "";
