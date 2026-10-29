@@ -3,12 +3,12 @@ package co.wethinkcode.logisticsconnect;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.io.IOException;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import java.util.List;
 import java.util.Map;
 
 /** Small shared-shape JSON parsing helper for this independent Maven module. */
-final class JsonParser {
+public final class JsonParser {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, Object>> OBJECT_TYPE = new TypeReference<>() {};
@@ -16,15 +16,22 @@ final class JsonParser {
 
     private JsonParser() {}
 
-    static Object parse(String json) throws IOException {
-        return MAPPER.readValue(json, Object.class);
+    public static Object parse(String json) {
+        try { return MAPPER.readValue(json, Object.class); }
+        catch (JsonProcessingException e) { throw invalidJson(e); }
     }
 
-    static Map<String, Object> parseObject(String json) throws IOException {
-        return MAPPER.readValue(json, OBJECT_TYPE);
+    public static Map<String, Object> parseObject(String json) {
+        try { return MAPPER.readValue(json, OBJECT_TYPE); }
+        catch (JsonProcessingException e) { throw invalidJson(e); }
     }
 
-    static List<Object> parseArray(String json) throws IOException {
-        return MAPPER.readValue(json, ARRAY_TYPE);
+    public static List<Object> parseArray(String json) {
+        try { return MAPPER.readValue(json, ARRAY_TYPE); }
+        catch (JsonProcessingException e) { throw invalidJson(e); }
+    }
+
+    private static IllegalArgumentException invalidJson(JsonProcessingException cause) {
+        return new IllegalArgumentException("Invalid JSON", cause);
     }
 }
