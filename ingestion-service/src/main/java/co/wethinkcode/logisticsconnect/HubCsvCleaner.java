@@ -11,46 +11,51 @@ import java.util.logging.Logger;
 /**
  * Cleans the messy legacy hubs-global.csv export.
  *
- * Casing rules:
- *   - *_id columns   -> UPPERCASE, whitespace stripped
- *   - province cols  -> canonical Title Case (SA provinces mapped explicitly)
- *   - status/type/category cols -> lowercase snake_case tokens
+ * Per-cell rules:
+ *   - trim padding; collapse internal whitespace (ASCII + Unicode) to one space
+ *   - placeholders (N/A, unknown, -, ...) -> null
+ *   - IDs -> UPPERCASE (no spaces)
+ *   - provinces -> canonical Title Case (SA provinces mapped)
+ *   - status/category/type -> lowercase snake_case tokens
+ *   - boolean/flag columns -> "true" / "false" (unknown tokens preserved)
+ *   - date-like columns -> ISO-8601 (no-op on current CSV; wired for extensions)
  *
- * Whitespace rules (applied to headers AND values):
- *   - Leading/trailing padding trimmed.
- *   - Any internal run of whitespace (ASCII or Unicode, incl. NBSP/tabs/newlines)
- *     collapsed to a single ASCII space.
- *   - Whitespace-only cells become null.
+ * ─────────────────────────────────────────────────────────────────────────
+ * DE-DUPLICATION STRATEGY (also logged at runtime for reviewability):
  *
- * Missing/placeholder values: cells matching a placeholder token (N/A, na, n.a,
- * nil, none, null, unknown, -, --, —, ?, tbd, not applicable, …) are normalized to
- * null so downstream code has a single "missing" representation to check.
- * Placeholders wrapped in brackets or with trailing dots are recognized too.
+ *  1. IDENTITY. A row's identity is its normalized hub_id. If absent, the
+ *     fallback is normalized (name + province). This is how a human would
+ *     recognize the same hub across exports — the ID when present, else the
+ *     human-readable label.
  *
- * Boolean/flag columns -> "true"/"false" (unrecognized tokens preserved).
+ *  2. EXACT DUPLICATES. Same identity + identical values after normalization
+ *     → keep one, count the rest. Nothing to choose between them.
  *
- * Date-like columns -> ISO-8601 via DateNormalizer (no-op on current CSV).
+ *  3. CONFLICTING DUPLICATES. Same identity, disagreeing fields → keep the
+ *     row with the most non-null fields. Rationale: the export likely
+ *     accumulated missing data over time, so the most-populated row is the
+ *     most trustworthy. We do NOT merge because merging invents rows the
+ *     source never had. Ties break on first occurrence (deterministic).
+ *
+ *  4. KEYLESS ROWS. No ID and no name → keyed by own content hash, so two
+ *     identical keyless rows still collapse to one. Nothing is silently lost.
+ *
+ * This is deliberately conservative: keep ambiguous data, log every decision.
+ * With a reliable last_updated column, step 3 would pick by recency instead.
+ * ─────────────────────────────────────────────────────────────────────────
  */
 final class HubCsvCleaner {
 
     private static final Logger LOG = Logger.getLogger(HubCsvCleaner.class.getName());
 
     private static final Set<String> PLACEHOLDERS = Set.of(
-            // empty
             "",
-            // N/A family
             "n/a", "na", "n.a",
-            // null family
             "null", "nil", "none", "nan", "undefined",
-            // unknown family
             "unknown", "unk", "unspecified",
-            // dash family (ASCII + Unicode variants)
             "-", "--", "---", "\u2014", "\u2013", "\u2212",
-            // question marks
             "?", "??", "???",
-            // deferred / future
             "tbd", "tba", "to be determined", "to be announced", "to be confirmed",
-            // descriptive
             "not set", "not provided", "no data", "empty",
             "not applicable", "not available");
 
@@ -88,25 +93,26 @@ final class HubCsvCleaner {
             headers[i] = normalizeHeader(rows.get(0)[i]);
         }
 
-        int placeholdersReplaced = 0;
         List<Map<String, String>> records = new ArrayList<>();
+        int fullyEmptyRows = 0;
         for (int r = 1; r < rows.size(); r++) {
-            String[] vals = rows.get(r);
-            for (int i = 0; i < headers.length; i++) {
-                if (isPlaceholder(collapseWhitespace(i < vals.length ? vals[i] : ""))) {
-                    placeholdersReplaced++;
-                }
+            Map<String, String> rec = toRecord(headers, rows.get(r));
+            if (rec.values().stream().anyMatch(v -> v != null)) {
+                records.add(rec);
+            } else {
+                fullyEmptyRows++;
             }
-            Map<String, String> rec = toRecord(headers, vals);
-            // Drop rows that were entirely placeholders / blank.
-            if (rec.values().stream().anyMatch(v -> v != null)) records.add(rec);
         }
 
-        List<Map<String, String>> out = dedupe(records);
-        final int ph = placeholdersReplaced;
-        LOG.info(() -> "Cleaned hubs-global.csv: " + records.size() + " rows -> "
-                + out.size() + " records, " + ph + " placeholder cell(s) replaced with null");
-        return out;
+        List<Map<String, String>> deduped = dedupe(records);
+
+        final int inputRows = rows.size() - 1;
+        final int empty = fullyEmptyRows;
+        final int kept = deduped.size();
+        LOG.info(() -> String.format(
+                "Cleaned hubs-global.csv: %d input rows -> %d records (empty_rows_dropped=%d)",
+                inputRows, kept, empty));
+        return deduped;
     }
 
     // ---- parsing ---------------------------------------------------------
@@ -163,7 +169,7 @@ final class HubCsvCleaner {
     static String normalizeValue(String header, String raw) {
         String v = collapseWhitespace(raw);
         if (isPlaceholder(v)) return null;
-        if (isIdentifierColumn(header))  return v.replaceAll("\\s+", "").toUpperCase(Locale.ROOT);
+        if (isIdentifierColumn(header))  return normalizeIdentifier(v);
         if (isProvinceColumn(header))    return canonicalProvince(v);
         if (isStatusOrCategory(header))  return v.toLowerCase(Locale.ROOT).replaceAll("\\s+", "_");
         if (isBooleanColumn(header)) {
@@ -182,28 +188,19 @@ final class HubCsvCleaner {
         return raw.replaceAll("[\\p{Z}\\s]+", " ").trim();
     }
 
-    /**
-     * Robust placeholder detection. Recognizes bare tokens, tokens wrapped in
-     * parentheses/brackets/angle brackets ({@code (unknown)}, {@code [N/A]},
-     * {@code <null>}), tokens with trailing dots ({@code N.A.}, {@code null.}),
-     * and slash spacing variants ({@code N / A}).
-     */
+    /** Canonical form for IDs: trimmed, no internal spaces, upper case. */
+    static String normalizeIdentifier(String v) {
+        return collapseWhitespace(v).replaceAll("\\s+", "").toUpperCase(Locale.ROOT);
+    }
+
     static boolean isPlaceholder(String v) {
         if (v == null) return true;
         String key = v.toLowerCase(Locale.ROOT).trim();
         if (key.isEmpty()) return true;
-
-        // strip surrounding wrapping punctuation: (), [], {}, <>
         key = key.replaceAll("^[([{<]+", "").replaceAll("[)\\]}>]+$", "").trim();
         if (key.isEmpty()) return true;
-
-        // collapse spaces around slashes: "N / A" -> "N/A"
         key = key.replaceAll("\\s*/\\s*", "/");
-
-        // strip trailing dots: "N.A." -> "N.A", "null." -> "null"
-        while (key.endsWith(".") && key.length() > 1) {
-            key = key.substring(0, key.length() - 1);
-        }
+        while (key.endsWith(".") && key.length() > 1) key = key.substring(0, key.length() - 1);
         return PLACEHOLDERS.contains(key);
     }
 
@@ -253,33 +250,54 @@ final class HubCsvCleaner {
                 || h.equals("verified")   || h.endsWith("_verified");
     }
 
-    // ---- dedup -----------------------------------------------------------
+    // ---- dedup (see class-level comment for the strategy) ----------------
 
-    private static List<Map<String, String>> dedupe(List<Map<String, String>> records) {
+    static List<Map<String, String>> dedupe(List<Map<String, String>> records) {
         Map<String, Map<String, String>> byKey = new LinkedHashMap<>();
+        int exactDuplicates = 0;
+        int conflictsResolved = 0;
+        int keyless = 0;
+
         for (Map<String, String> rec : records) {
             String key = dedupeKey(rec);
-            if (key == null) key = "row:" + byKey.size();
+            if (key.startsWith("content:")) keyless++;
             Map<String, String> existing = byKey.get(key);
-            if (existing == null || populatedCount(rec) > populatedCount(existing)) {
+            if (existing == null) {
                 byKey.put(key, rec);
+            } else if (existing.equals(rec)) {
+                exactDuplicates++;
+            } else {
+                conflictsResolved++;
+                // Most-populated wins; on a tie, first occurrence is kept.
+                if (populatedCount(rec) > populatedCount(existing)) {
+                    byKey.put(key, rec);
+                }
             }
         }
+
+        final int ed = exactDuplicates, cr = conflictsResolved, kl = keyless;
+        final int kept = byKey.size(), input = records.size();
+        LOG.info(() -> String.format(
+                "Dedup: %d -> %d records (exact_dupes_dropped=%d, conflicts_resolved=%d, keyless_rows=%d)",
+                input, kept, ed, cr, kl));
         return new ArrayList<>(byKey.values());
     }
 
-    private static String dedupeKey(Map<String, String> rec) {
+    static String dedupeKey(Map<String, String> rec) {
+        // 1. Explicit ID column
         for (String k : new String[]{"hub_id", "code", "hub_code", "id"}) {
             String v = rec.get(k);
             if (v != null && !v.isBlank()) return "id:" + v;
         }
+        // 2. (name + province) fallback
         String name = firstNonNull(rec, "name", "hub_name", "sorting_center_name");
         if (name != null) {
             String province = firstNonNull(rec, "province", "region");
             return "name:" + name.toLowerCase(Locale.ROOT) + "|"
                     + (province == null ? "" : province.toLowerCase(Locale.ROOT));
         }
-        return null;
+        // 3. No identity: content itself is the key, so identical keyless rows still dedupe
+        return "content:" + rec;
     }
 
     private static String firstNonNull(Map<String, String> rec, String... keys) {
@@ -294,5 +312,16 @@ final class HubCsvCleaner {
         int n = 0;
         for (String v : rec.values()) if (v != null && !v.isBlank()) n++;
         return n;
+    }
+
+    // ---- lookup helper used by the REST layer ---------------------------
+
+    static Map<String, String> findById(List<Map<String, String>> hubs, String rawId) {
+        String requested = normalizeIdentifier(rawId);
+        for (Map<String, String> hub : hubs) {
+            String id = firstNonNull(hub, "hub_id", "id", "code", "hub_code");
+            if (requested.equals(id)) return hub;
+        }
+        return null;
     }
 }
