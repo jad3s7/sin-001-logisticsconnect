@@ -2,7 +2,6 @@ package co.wethinkcode.logisticsconnect;
 
 import java.util.Map;
 
-/** Tiny JSON encoder so no extra dependency is added to ingestion-service. */
 final class Json {
 
     private Json() {}
@@ -11,6 +10,13 @@ final class Json {
         StringBuilder sb = new StringBuilder();
         write(sb, value);
         return sb.toString();
+    }
+
+    static String escape(String s) {
+        StringBuilder sb = new StringBuilder();
+        writeString(sb, s);
+        // Strip the surrounding quotes; caller embeds this inside its own body.
+        return sb.substring(1, sb.length() - 1);
     }
 
     private static void write(StringBuilder sb, Object v) {
