@@ -22,19 +22,37 @@ import java.util.logging.Logger;
  *     collapsed to a single ASCII space.
  *   - Whitespace-only cells become null.
  *
- * Boolean/flag columns (is_*, has_*, *_flag, and *_active/_enabled/_operational/
- * _available/_verified) normalize to the two literals "true" and "false".
- * Unknown tokens are preserved so nothing is silently lost.
+ * Missing/placeholder values: cells matching a placeholder token (N/A, na, n.a,
+ * nil, none, null, unknown, -, --, —, ?, tbd, not applicable, …) are normalized to
+ * null so downstream code has a single "missing" representation to check.
+ * Placeholders wrapped in brackets or with trailing dots are recognized too.
  *
- * Date-like columns normalize to ISO-8601 via DateNormalizer (no-op on the
- * current CSV; wired for future extensions and the stage-3 MQ timestamp).
+ * Boolean/flag columns -> "true"/"false" (unrecognized tokens preserved).
+ *
+ * Date-like columns -> ISO-8601 via DateNormalizer (no-op on current CSV).
  */
 final class HubCsvCleaner {
 
     private static final Logger LOG = Logger.getLogger(HubCsvCleaner.class.getName());
 
     private static final Set<String> PLACEHOLDERS = Set.of(
-            "", "n/a", "na", "n.a.", "null", "none", "unknown", "-", "--", "?", "tbd");
+            // empty
+            "",
+            // N/A family
+            "n/a", "na", "n.a",
+            // null family
+            "null", "nil", "none", "nan", "undefined",
+            // unknown family
+            "unknown", "unk", "unspecified",
+            // dash family (ASCII + Unicode variants)
+            "-", "--", "---", "\u2014", "\u2013", "\u2212",
+            // question marks
+            "?", "??", "???",
+            // deferred / future
+            "tbd", "tba", "to be determined", "to be announced", "to be confirmed",
+            // descriptive
+            "not set", "not provided", "no data", "empty",
+            "not applicable", "not available");
 
     private static final Map<String, String> SA_PROVINCES = Map.ofEntries(
             Map.entry("gauteng", "Gauteng"),
@@ -49,17 +67,15 @@ final class HubCsvCleaner {
             Map.entry("north west", "North West"),
             Map.entry("northern cape", "Northern Cape"));
 
-    /** Every token that we recognize as TRUE, lowercased. */
     private static final Set<String> BOOLEAN_TRUE = Set.of(
             "y", "yes", "true", "t", "1", "1.0", "on",
             "active", "enabled", "operational", "available", "verified",
-            "\u2611", "\u2713", "\u2714"); // ☑ ✓ ✔
+            "\u2611", "\u2713", "\u2714");
 
-    /** Every token that we recognize as FALSE, lowercased. */
     private static final Set<String> BOOLEAN_FALSE = Set.of(
             "n", "no", "false", "f", "0", "0.0", "off",
             "inactive", "disabled", "not operational", "not available", "unverified",
-            "\u2610", "\u2717", "\u2718"); // ☐ ✗ ✘
+            "\u2610", "\u2717", "\u2718");
 
     private HubCsvCleaner() {}
 
@@ -72,15 +88,24 @@ final class HubCsvCleaner {
             headers[i] = normalizeHeader(rows.get(0)[i]);
         }
 
+        int placeholdersReplaced = 0;
         List<Map<String, String>> records = new ArrayList<>();
         for (int r = 1; r < rows.size(); r++) {
-            Map<String, String> rec = toRecord(headers, rows.get(r));
+            String[] vals = rows.get(r);
+            for (int i = 0; i < headers.length; i++) {
+                if (isPlaceholder(collapseWhitespace(i < vals.length ? vals[i] : ""))) {
+                    placeholdersReplaced++;
+                }
+            }
+            Map<String, String> rec = toRecord(headers, vals);
+            // Drop rows that were entirely placeholders / blank.
             if (rec.values().stream().anyMatch(v -> v != null)) records.add(rec);
         }
 
         List<Map<String, String>> out = dedupe(records);
-        LOG.info(() -> "Cleaned hubs-global.csv: " + records.size()
-                + " rows -> " + out.size() + " records");
+        final int ph = placeholdersReplaced;
+        LOG.info(() -> "Cleaned hubs-global.csv: " + records.size() + " rows -> "
+                + out.size() + " records, " + ph + " placeholder cell(s) replaced with null");
         return out;
     }
 
@@ -144,7 +169,6 @@ final class HubCsvCleaner {
         if (isBooleanColumn(header)) {
             String b = asBoolean(v);
             if (b != null) return b;
-            // Unknown token in a boolean column: preserve it (never lose data).
         }
         if (DateNormalizer.isDateColumn(header)) {
             String d = DateNormalizer.normalize(v);
@@ -158,8 +182,29 @@ final class HubCsvCleaner {
         return raw.replaceAll("[\\p{Z}\\s]+", " ").trim();
     }
 
-    private static boolean isPlaceholder(String v) {
-        return PLACEHOLDERS.contains(v.toLowerCase(Locale.ROOT));
+    /**
+     * Robust placeholder detection. Recognizes bare tokens, tokens wrapped in
+     * parentheses/brackets/angle brackets ({@code (unknown)}, {@code [N/A]},
+     * {@code <null>}), tokens with trailing dots ({@code N.A.}, {@code null.}),
+     * and slash spacing variants ({@code N / A}).
+     */
+    static boolean isPlaceholder(String v) {
+        if (v == null) return true;
+        String key = v.toLowerCase(Locale.ROOT).trim();
+        if (key.isEmpty()) return true;
+
+        // strip surrounding wrapping punctuation: (), [], {}, <>
+        key = key.replaceAll("^[([{<]+", "").replaceAll("[)\\]}>]+$", "").trim();
+        if (key.isEmpty()) return true;
+
+        // collapse spaces around slashes: "N / A" -> "N/A"
+        key = key.replaceAll("\\s*/\\s*", "/");
+
+        // strip trailing dots: "N.A." -> "N.A", "null." -> "null"
+        while (key.endsWith(".") && key.length() > 1) {
+            key = key.substring(0, key.length() - 1);
+        }
+        return PLACEHOLDERS.contains(key);
     }
 
     private static String canonicalProvince(String v) {
@@ -179,7 +224,6 @@ final class HubCsvCleaner {
         return sb.toString();
     }
 
-    /** Returns "true"/"false" for recognized tokens, or null when unrecognized. */
     static String asBoolean(String v) {
         String key = v.toLowerCase(Locale.ROOT);
         if (BOOLEAN_TRUE.contains(key))  return "true";
