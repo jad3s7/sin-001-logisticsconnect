@@ -1,8 +1,6 @@
 package co.wethinkcode.logisticsconnect.mq;
 
 import co.wethinkcode.logisticsconnect.JsonParser;
-import co.wethinkcode.logisticsconnect.MqStats;
-import co.wethinkcode.logisticsconnect.StageCache;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
 import javax.jms.Connection;
@@ -14,26 +12,35 @@ import javax.jms.Session;
 import javax.jms.TextMessage;
 import java.time.Instant;
 import java.util.Map;
+import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
+/**
+ * Subscribes to package-status-topic and forwards each decoded message to a
+ * callback. No stage state is kept here; policy (thresholding, dedup) lives in
+ * the caller. Same class shape as transit-service's subscriber for symmetry.
+ */
 public class PackageStatusSubscriber implements AutoCloseable, MessageListener {
 
     private static final Logger LOG = Logger.getLogger(PackageStatusSubscriber.class.getName());
 
-    private final StageCache cache;
-    private final MqStats stats;
+    public record MessageData(String hubId, int stage, Instant timestamp) {}
+
+    private final BiConsumer<String, Integer> onStageChange;   // (hubId, stage)
+    private final java.util.function.BiConsumer<MessageData, Boolean> onMessage;
     private final Connection connection;
     private final Session session;
     private final MessageConsumer consumer;
 
-    public PackageStatusSubscriber(StageCache cache, MqStats stats) throws JMSException {
-        this(cache, stats, MqConfig.BROKER_URL, MqConfig.TOPIC);
+    public PackageStatusSubscriber(BiConsumer<MessageData, Boolean> onMessage) throws JMSException {
+        this(onMessage, MqConfig.BROKER_URL, MqConfig.TOPIC);
     }
 
-    public PackageStatusSubscriber(StageCache cache, MqStats stats, String brokerUrl, String topic)
-            throws JMSException {
-        this.cache = cache;
-        this.stats = stats;
+    public PackageStatusSubscriber(BiConsumer<MessageData, Boolean> onMessage,
+                                   String brokerUrl, String topic) throws JMSException {
+        // Accept the simpler signature used by tests; this field is only there for symmetry.
+        this.onMessage   = onMessage;
+        this.onStageChange = (id, s) -> { };
 
         ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(brokerUrl);
         factory.setUserName(MqConfig.USER);
@@ -44,48 +51,31 @@ public class PackageStatusSubscriber implements AutoCloseable, MessageListener {
         this.consumer   = session.createConsumer(session.createTopic(topic));
         this.consumer.setMessageListener(this);
 
-        stats.markConnected(brokerUrl, topic);
-        LOG.info(() -> "SUBSCRIBED to " + topic + " at " + brokerUrl
-                + " — no further synchronous calls to delay-stage-service");
+        LOG.info(() -> "AlertBot SUBSCRIBED to " + topic + " at " + brokerUrl);
     }
 
     @Override
     public void onMessage(Message message) {
-        if (!(message instanceof TextMessage text)) { stats.recordRejected(); return; }
+        if (!(message instanceof TextMessage text)) return;
         try {
-            applyPayload(text.getText(), cache, stats);
+            MessageData data = parse(text.getText());
+            if (data == null) { onMessage.accept(null, false); return; }
+            onMessage.accept(data, true);
         } catch (Exception e) {
-            stats.recordRejected();
-            LOG.warning("Rejected message: " + e.getMessage());
+            onMessage.accept(null, false);
+            LOG.warning("Bad message: " + e.getMessage());
         }
     }
 
-    /**
-     * Static so tests can drive it directly without a live broker, and so the
-     * payload contract is validated in one place.
-     */
-    static void applyPayload(String payload, StageCache cache, MqStats stats) {
+    static MessageData parse(String payload) {
         Map<String, Object> obj = JsonParser.parseObject(payload);
-        Object hubIdO = obj.get("hubId");
-        Object stageO = obj.get("stage");
-        Object tsO    = obj.get("timestamp");
-
-        if (!(hubIdO instanceof String hubId) || hubId.isBlank()) {
-            throw new IllegalArgumentException("payload missing hubId");
-        }
-        if (!(stageO instanceof Number stageN)) {
-            throw new IllegalArgumentException("payload missing numeric stage");
-        }
-        int stage = stageN.intValue();
-        if (stage < 0 || stage > 8) {
-            throw new IllegalArgumentException("stage out of range: " + stage);
-        }
+        Object hubO = obj.get("hubId");
+        Object stO  = obj.get("stage");
+        Object tsO  = obj.get("timestamp");
+        if (!(hubO instanceof String hub) || hub.isBlank()) return null;
+        if (!(stO instanceof Number st)) return null;
         Instant ts = (tsO instanceof String s) ? Instant.parse(s) : Instant.now();
-
-        cache.update(hubId, stage, ts);
-        stats.recordReceived();
-        LOG.info(() -> "Received from " + MqConfig.TOPIC + ": " + hubId
-                + " stage=" + stage + " ts=" + ts);
+        return new MessageData(hub, st.intValue(), ts);
     }
 
     @Override
