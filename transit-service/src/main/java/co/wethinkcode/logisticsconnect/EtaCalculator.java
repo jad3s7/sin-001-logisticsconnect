@@ -4,9 +4,9 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
 /**
- * ETA policy: a base transit time of 2 hours plus one hour per delay stage.
- * Stage 0 = 2h (normal), stage 8 = 10h (weather shutdown).
- * Extracted as its own class so the math is unit-tested independently of HTTP.
+ * ETA policy: base transit time of 2 hours plus one hour per delay stage.
+ *   Stage 0 = 2h (normal)  ...  Stage 8 = 10h (weather shutdown).
+ * Pure math, no HTTP, no clock — easy to unit-test.
  */
 final class EtaCalculator {
 
@@ -14,9 +14,12 @@ final class EtaCalculator {
 
     private EtaCalculator() {}
 
+    static int clampStage(int stage) {
+        return Math.max(0, Math.min(8, stage));
+    }
+
     static long totalHoursFor(int stage) {
-        int s = Math.max(0, Math.min(8, stage));
-        return BASE_HOURS + s;
+        return BASE_HOURS + clampStage(stage);
     }
 
     static Instant compute(Instant now, int stage) {

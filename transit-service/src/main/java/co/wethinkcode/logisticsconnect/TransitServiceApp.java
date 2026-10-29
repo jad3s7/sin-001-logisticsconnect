@@ -16,10 +16,13 @@ public class TransitServiceApp {
     public static void main(String[] args) {
         String hubUrl   = args.length > 0 ? args[0] : DEFAULT_HUB_URL;
         String delayUrl = args.length > 1 ? args[1] : DEFAULT_DELAY_URL;
+
         Javalin app = Javalin.create();
         registerRoutes(app, hubUrl, delayUrl);
         app.start(7053);
-        LOG.info(() -> "Transit service ready on :7053 (hub=" + hubUrl + ", delay=" + delayUrl + ")");
+
+        LOG.info(() -> "Transit service ready on :7053 (hub-service=" + hubUrl
+                + ", delay-stage-service=" + delayUrl + ")");
     }
 
     static void registerRoutes(Javalin app, String hubUrl, String delayUrl) {
@@ -28,9 +31,13 @@ public class TransitServiceApp {
         app.get("/eta/{hubId}", ctx -> {
             String rawId = ctx.pathParam("hubId");
             String id = normalizeId(rawId);
+
             try {
-                // 1. Hub details from hub-service (place-name source of truth).
-                Http.Response hubResp = Http.get(hubUrl + "/hubs/" + id);
+                // ── 1. Hub details from hub-service (place-name source of truth)
+                Http.Response hubResp = Http.get(hubUrl.replaceAll("/+$", "")
+                        + "/hubs/" + id);
+                LOG.fine(() -> "transit -> hub-service GET /hubs/" + id
+                        + " -> " + hubResp.status());
                 if (hubResp.status() == 404) {
                     fail(ctx, 404, "hub not found: " + rawId);
                     return;
@@ -41,8 +48,11 @@ public class TransitServiceApp {
                 }
                 Map<String, Object> hub = JsonParser.parseObject(hubResp.body());
 
-                // 2. Current delay stage from delay-stage-service.
-                Http.Response delayResp = Http.get(delayUrl + "/delay-stage/" + id);
+                // ── 2. Current delay stage from delay-stage-service
+                Http.Response delayResp = Http.get(delayUrl.replaceAll("/+$", "")
+                        + "/delay-stage/" + id);
+                LOG.fine(() -> "transit -> delay-stage-service GET /delay-stage/" + id
+                        + " -> " + delayResp.status());
                 if (delayResp.status() == 404) {
                     fail(ctx, 404, "no delay stage for hub: " + rawId);
                     return;
@@ -54,24 +64,31 @@ public class TransitServiceApp {
                 Map<String, Object> delay = JsonParser.parseObject(delayResp.body());
 
                 Object stageRaw = delay.get("stage");
-                if (!(stageRaw instanceof Number)) {
-                    fail(ctx, 502, "delay-stage response missing 'stage'");
+                if (!(stageRaw instanceof Number n)) {
+                    fail(ctx, 502, "delay-stage response missing numeric 'stage'");
                     return;
                 }
-                int stage = ((Number) stageRaw).intValue();
+                int stage = n.intValue();
 
-                // 3. Compute the ETA.
-                Instant eta = EtaCalculator.compute(Instant.now(), stage);
-                long delayHours = EtaCalculator.totalHoursFor(stage);
+                // ── 3. Compute and shape the ETA
+                Instant computedAt = Instant.now();
+                Instant eta        = EtaCalculator.compute(computedAt, stage);
 
                 String body = "{"
-                        + "\"hubId\":\""     + Json.escape(id)                        + "\","
-                        + "\"hubName\":\""   + Json.escape(str(hub.get("name")))     + "\","
-                        + "\"province\":\""  + Json.escape(str(hub.get("province"))) + "\","
-                        + "\"stage\":"       + stage                                 + ","
-                        + "\"delayHours\":"  + delayHours                            + ","
-                        + "\"eta\":\""       + eta                                   + "\""
+                        + "\"hubId\":\""      + Json.escape(id)                        + "\","
+                        + "\"hubName\":\""    + Json.escape(str(hub.get("name")))     + "\","
+                        + "\"province\":\""   + Json.escape(str(hub.get("province"))) + "\","
+                        + "\"stage\":"        + stage                                 + ","
+                        + "\"baseHours\":"    + EtaCalculator.BASE_HOURS              + ","
+                        + "\"totalHours\":"   + EtaCalculator.totalHoursFor(stage)    + ","
+                        + "\"computedAt\":\"" + computedAt                            + "\","
+                        + "\"eta\":\""        + eta                                   + "\""
                         + "}";
+
+                LOG.info(() -> "ETA for " + id + ": stage=" + stage
+                        + " totalHours=" + EtaCalculator.totalHoursFor(stage)
+                        + " eta=" + eta);
+
                 ctx.contentType("application/json").result(body);
             } catch (Exception e) {
                 LOG.warning("ETA failed for " + id + ": " + e);
