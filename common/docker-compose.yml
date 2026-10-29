@@ -1,12 +1,34 @@
-version: "3.8"
+# ActiveMQ broker for LogisticsConnect
+# - OpenWire (services): tcp://localhost:61616
+# - STOMP:               tcp://localhost:61613
+# - Web console:         http://localhost:8161  (admin / admin)
+#
+# Start:    cd common && docker compose up -d
+# Status:   docker compose ps           # STATUS shows (healthy) when ready
+# Logs:     docker compose logs -f activemq
+# Stop:     docker compose down         # keeps volume
+# Reset:    docker compose down -v      # wipes broker state
 services:
   activemq:
     image: apache/activemq-classic:5.18.3
     container_name: logisticsconnect-mq
+    hostname: logisticsconnect-mq
     restart: unless-stopped
     ports:
-      - "61616:61616"   # OpenWire (services)
-      - "8161:8161"     # Web console (http://localhost:8161, admin/admin)
+      - "61616:61616"   # OpenWire — what the services use
+      - "61613:61613"   # STOMP   — not used, but standard
+      - "8161:8161"     # Web console
+    environment:
+      ACTIVEMQ_ADMIN_LOGIN:    ${ACTIVEMQ_ADMIN_LOGIN:-admin}
+      ACTIVEMQ_ADMIN_PASSWORD: ${ACTIVEMQ_ADMIN_PASSWORD:-admin}
+    healthcheck:
+      # Opens and closes a TCP connection to the OpenWire port.
+      # Works on the Debian-based image without extra tooling.
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/127.0.0.1/61616' 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     volumes:
       - mq-data:/opt/apache-activemq/data
 
