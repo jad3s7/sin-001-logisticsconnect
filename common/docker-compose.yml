@@ -2,6 +2,13 @@ version: "3.8"
 services:
   activemq:
     image: apache/activemq-classic:5.18.3
+    container_name: logisticsconnect-mq
+    restart: unless-stopped
     ports:
-      - "61616:61616"   # OpenWire (client connections)
-      - "8161:8161"     # Web console
+      - "61616:61616"   # OpenWire (services)
+      - "8161:8161"     # Web console (http://localhost:8161, admin/admin)
+    volumes:
+      - mq-data:/opt/apache-activemq/data
+
+volumes:
+  mq-data:
