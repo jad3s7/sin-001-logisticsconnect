@@ -1,6 +1,8 @@
 package co.wethinkcode.logisticsconnect.mq;
 
 import co.wethinkcode.logisticsconnect.JsonParser;
+import co.wethinkcode.logisticsconnect.MqStats;
+import co.wethinkcode.logisticsconnect.StageCache;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
 import javax.jms.Connection;
@@ -31,6 +33,18 @@ public class PackageStatusSubscriber implements AutoCloseable, MessageListener {
     private final Connection connection;
     private final Session session;
     private final MessageConsumer consumer;
+
+    public PackageStatusSubscriber(StageCache cache, MqStats stats) throws JMSException {
+        this((data, valid) -> {
+            if (valid && data != null) {
+                cache.update(data.hubId(), data.stage(), data.timestamp());
+                stats.recordReceived();
+            } else {
+                stats.recordRejected();
+            }
+        }, MqConfig.BROKER_URL, MqConfig.TOPIC);
+        stats.markConnected(MqConfig.BROKER_URL, MqConfig.TOPIC);
+    }
 
     public PackageStatusSubscriber(BiConsumer<MessageData, Boolean> onMessage) throws JMSException {
         this(onMessage, MqConfig.BROKER_URL, MqConfig.TOPIC);
