@@ -1,6 +1,7 @@
 package co.wethinkcode.logisticsconnect;
 
 import io.javalin.Javalin;
+import io.javalin.http.Context;
 
 import java.time.Instant;
 import java.util.Locale;
@@ -21,56 +22,41 @@ public class TransitServiceApp {
         registerRoutes(app, hubUrl, delayUrl);
         app.start(7053);
 
-        LOG.info(() -> "Transit service ready on :7053 (hub-service=" + hubUrl
-                + ", delay-stage-service=" + delayUrl + ")");
+        LOG.info(() -> "Transit service ready on :7053 (hub=" + hubUrl + ", delay=" + delayUrl + ")");
     }
 
     static void registerRoutes(Javalin app, String hubUrl, String delayUrl) {
+        // ── Global HTTP semantics ─────────────────────────────────────────
+        app.error(404, ctx -> jsonError(ctx, 404,
+                "no route matches " + ctx.method() + " " + ctx.path()));
+        app.error(405, ctx -> jsonError(ctx, 405,
+                "method " + ctx.method() + " not allowed on " + ctx.path()));
+        app.exception(Exception.class, (e, ctx) -> {
+            LOG.warning("unhandled on " + ctx.method() + " " + ctx.path() + ": " + e);
+            jsonError(ctx, 500, "internal error");
+        });
+
+        // ── Routes ────────────────────────────────────────────────────────
         app.get("/health", ctx -> ctx.result("OK"));
 
         app.get("/eta/{hubId}", ctx -> {
             String rawId = ctx.pathParam("hubId");
             String id = normalizeId(rawId);
-
             try {
-                // ── 1. Hub details from hub-service (place-name source of truth)
-                Http.Response hubResp = Http.get(hubUrl.replaceAll("/+$", "")
-                        + "/hubs/" + id);
-                LOG.fine(() -> "transit -> hub-service GET /hubs/" + id
-                        + " -> " + hubResp.status());
-                if (hubResp.status() == 404) {
-                    fail(ctx, 404, "hub not found: " + rawId);
-                    return;
-                }
-                if (hubResp.status() != 200) {
-                    fail(ctx, 502, "hub-service returned " + hubResp.status());
-                    return;
-                }
+                Http.Response hubResp = Http.get(hubUrl.replaceAll("/+$", "") + "/hubs/" + id);
+                if (hubResp.status() == 404) { jsonError(ctx, 404, "hub not found: " + rawId); return; }
+                if (hubResp.status() != 200) { jsonError(ctx, 502, "hub-service returned " + hubResp.status()); return; }
                 Map<String, Object> hub = JsonParser.parseObject(hubResp.body());
 
-                // ── 2. Current delay stage from delay-stage-service
-                Http.Response delayResp = Http.get(delayUrl.replaceAll("/+$", "")
-                        + "/delay-stage/" + id);
-                LOG.fine(() -> "transit -> delay-stage-service GET /delay-stage/" + id
-                        + " -> " + delayResp.status());
-                if (delayResp.status() == 404) {
-                    fail(ctx, 404, "no delay stage for hub: " + rawId);
-                    return;
-                }
-                if (delayResp.status() != 200) {
-                    fail(ctx, 502, "delay-stage-service returned " + delayResp.status());
-                    return;
-                }
+                Http.Response delayResp = Http.get(delayUrl.replaceAll("/+$", "") + "/delay-stage/" + id);
+                if (delayResp.status() == 404) { jsonError(ctx, 404, "no delay stage for hub: " + rawId); return; }
+                if (delayResp.status() != 200) { jsonError(ctx, 502, "delay-stage-service returned " + delayResp.status()); return; }
                 Map<String, Object> delay = JsonParser.parseObject(delayResp.body());
 
                 Object stageRaw = delay.get("stage");
-                if (!(stageRaw instanceof Number n)) {
-                    fail(ctx, 502, "delay-stage response missing numeric 'stage'");
-                    return;
-                }
+                if (!(stageRaw instanceof Number n)) { jsonError(ctx, 502, "delay-stage missing numeric 'stage'"); return; }
                 int stage = n.intValue();
 
-                // ── 3. Compute and shape the ETA
                 Instant computedAt = Instant.now();
                 Instant eta        = EtaCalculator.compute(computedAt, stage);
 
@@ -84,23 +70,20 @@ public class TransitServiceApp {
                         + "\"computedAt\":\"" + computedAt                            + "\","
                         + "\"eta\":\""        + eta                                   + "\""
                         + "}";
-
-                LOG.info(() -> "ETA for " + id + ": stage=" + stage
-                        + " totalHours=" + EtaCalculator.totalHoursFor(stage)
-                        + " eta=" + eta);
-
-                ctx.contentType("application/json").result(body);
+                json(ctx, 200, body);
             } catch (Exception e) {
                 LOG.warning("ETA failed for " + id + ": " + e);
-                fail(ctx, 502, "upstream failure: " + e.getMessage());
+                jsonError(ctx, 502, "upstream failure: " + e.getMessage());
             }
         });
     }
 
-    private static void fail(io.javalin.http.Context ctx, int status, String msg) {
-        ctx.status(status);
-        ctx.contentType("application/json")
-                .result("{\"error\":\"" + Json.escape(msg) + "\"}");
+    private static void json(Context ctx, int status, String body) {
+        ctx.status(status).contentType("application/json").result(body);
+    }
+
+    private static void jsonError(Context ctx, int status, String msg) {
+        json(ctx, status, "{\"error\":\"" + Json.escape(msg) + "\",\"status\":" + status + "}");
     }
 
     private static String str(Object o) { return o == null ? "" : String.valueOf(o); }
