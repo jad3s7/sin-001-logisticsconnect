@@ -20,9 +20,11 @@ public class TransitServiceApp {
         String hubUrl = args.length > 0 ? args[0] : DEFAULT_HUB_URL;
 
         StageCache cache = new StageCache();
+        MqStats stats = new MqStats();
+
         PackageStatusSubscriber subscriber;
         try {
-            subscriber = new PackageStatusSubscriber(cache);
+            subscriber = new PackageStatusSubscriber(cache, stats);
         } catch (JMSException e) {
             LOG.severe("Failed to connect to broker " + MqConfig.BROKER_URL + ": " + e.getMessage());
             LOG.severe("Start it with: cd common && docker compose up -d");
@@ -30,7 +32,7 @@ public class TransitServiceApp {
         }
 
         Javalin app = Javalin.create();
-        registerRoutes(app, hubUrl, cache);
+        registerRoutes(app, hubUrl, cache, stats);
         app.start(7053);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -38,11 +40,13 @@ public class TransitServiceApp {
             subscriber.close();
         }));
 
-        LOG.info(() -> "Transit service ready on :7053 (hub=" + hubUrl
-                + ", broker=" + MqConfig.BROKER_URL + ", topic=" + MqConfig.TOPIC + ")");
+        LOG.info(() -> "Transit service ready on :7053 — stages sourced from MQ topic "
+                + MqConfig.TOPIC + " (broker " + MqConfig.BROKER_URL + ")"
+                + ", hub names from " + hubUrl);
+        LOG.info("Delay-stage-service will NOT be called synchronously.");
     }
 
-    static void registerRoutes(Javalin app, String hubUrl, StageCache cache) {
+    static void registerRoutes(Javalin app, String hubUrl, StageCache cache, MqStats stats) {
         app.error(404, ctx -> jsonError(ctx, 404,
                 "no route matches " + ctx.method() + " " + ctx.path()));
         app.error(405, ctx -> jsonError(ctx, 405,
@@ -54,11 +58,21 @@ public class TransitServiceApp {
 
         app.get("/health", ctx -> ctx.result("OK"));
 
-        // Ops visibility into the current view of the world from MQ.
+        // Observability for the subscription: connection state, counters, last receipt.
+        app.get("/mq-status", ctx -> json(ctx, 200, stats.toJson(cache.size())));
+
+        // Current view of stage data (for ops eyeballing + stage 4 reuse).
         app.get("/stages", ctx -> {
             StringBuilder sb = new StringBuilder("{");
-            // we can't iterate StageCache's map from outside; add a list endpoint later if needed
-            sb.append("\"size\":").append(cache.size()).append("}");
+            boolean first = true;
+            for (Map.Entry<String, StageCache.Entry> e : cache.snapshot().entrySet()) {
+                if (!first) sb.append(',');
+                first = false;
+                sb.append('"').append(Json.escape(e.getKey())).append("\":{")
+                        .append("\"stage\":").append(e.getValue().stage()).append(',')
+                        .append("\"observedAt\":\"").append(e.getValue().timestamp()).append("\"}");
+            }
+            sb.append('}');
             json(ctx, 200, sb.toString());
         });
 
@@ -66,7 +80,7 @@ public class TransitServiceApp {
             String rawId = ctx.pathParam("hubId");
             String id = normalizeId(rawId);
             try {
-                // ── 1. Stage from MQ-driven cache (replaces sync delay-stage call)
+                // ── 1. Stage from MQ-driven cache. NO synchronous call to delay-stage-service.
                 StageCache.Entry stageEntry = cache.get(id).orElse(null);
                 if (stageEntry == null) {
                     jsonError(ctx, 404, "no MQ status received yet for hub: " + rawId);
@@ -74,26 +88,25 @@ public class TransitServiceApp {
                 }
                 int stage = stageEntry.stage();
 
-                // ── 2. Hub details from hub-service (still sync — place-name source)
+                // ── 2. Hub details from hub-service (still sync — place-name source).
                 Http.Response hubResp = Http.get(hubUrl.replaceAll("/+$", "") + "/hubs/" + id);
                 if (hubResp.status() == 404) { jsonError(ctx, 404, "hub not found: " + rawId); return; }
                 if (hubResp.status() != 200) { jsonError(ctx, 502, "hub-service returned " + hubResp.status()); return; }
                 Map<String, Object> hub = JsonParser.parseObject(hubResp.body());
 
-                // ── 3. ETA
                 Instant computedAt = Instant.now();
                 Instant eta        = EtaCalculator.compute(computedAt, stage);
 
                 String body = "{"
-                        + "\"hubId\":\""       + Json.escape(id)                        + "\","
-                        + "\"hubName\":\""     + Json.escape(str(hub.get("name")))     + "\","
-                        + "\"province\":\""    + Json.escape(str(hub.get("province"))) + "\","
-                        + "\"stage\":"         + stage                                 + ","
-                        + "\"stageObservedAt\":\"" + stageEntry.timestamp()            + "\","
-                        + "\"baseHours\":"     + EtaCalculator.BASE_HOURS              + ","
-                        + "\"totalHours\":"    + EtaCalculator.totalHoursFor(stage)    + ","
-                        + "\"computedAt\":\""  + computedAt                            + "\","
-                        + "\"eta\":\""         + eta                                   + "\""
+                        + "\"hubId\":\""           + Json.escape(id)                        + "\","
+                        + "\"hubName\":\""         + Json.escape(str(hub.get("name")))     + "\","
+                        + "\"province\":\""        + Json.escape(str(hub.get("province"))) + "\","
+                        + "\"stage\":"             + stage                                 + ","
+                        + "\"stageObservedAt\":\"" + stageEntry.timestamp()                + "\","
+                        + "\"baseHours\":"         + EtaCalculator.BASE_HOURS              + ","
+                        + "\"totalHours\":"        + EtaCalculator.totalHoursFor(stage)    + ","
+                        + "\"computedAt\":\""      + computedAt                            + "\","
+                        + "\"eta\":\""             + eta                                   + "\""
                         + "}";
                 json(ctx, 200, body);
             } catch (Exception e) {
