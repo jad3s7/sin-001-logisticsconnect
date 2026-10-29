@@ -1,6 +1,7 @@
 package co.wethinkcode.logisticsconnect;
 
 import io.javalin.Javalin;
+import io.javalin.http.Context;
 
 import java.util.Locale;
 import java.util.Map;
@@ -21,50 +22,64 @@ public class DelayStageServiceApp {
     }
 
     static void registerRoutes(Javalin app, Map<String, Integer> stages) {
+        // ── Global HTTP semantics ─────────────────────────────────────────
+        app.error(404, ctx -> jsonError(ctx, 404,
+                "no route matches " + ctx.method() + " " + ctx.path()));
+        app.error(405, ctx -> jsonError(ctx, 405,
+                "method " + ctx.method() + " not allowed on " + ctx.path()));
+        app.exception(Exception.class, (e, ctx) -> {
+            LOG.warning("unhandled on " + ctx.method() + " " + ctx.path() + ": " + e);
+            jsonError(ctx, 500, "internal error");
+        });
+
+        // ── Routes ────────────────────────────────────────────────────────
         app.get("/health", ctx -> ctx.result("OK"));
 
-        // Ops convenience: view all known stage assignments.
-        app.get("/delay-stage", ctx ->
-                ctx.contentType("application/json").result(Json.encode(stages)));
+        app.get("/delay-stage", ctx -> json(ctx, 200, Json.encode(stages)));
 
         app.get("/delay-stage/{hubId}", ctx -> {
-            String id = normalizeId(ctx.pathParam("hubId"));
+            String raw = ctx.pathParam("hubId");
+            String id = normalizeId(raw);
             Integer stage = stages.get(id);
-            if (stage == null) {
-                ctx.status(404);
-                ctx.contentType("application/json")
-                        .result("{\"error\":\"no stage for hub: " + Json.escape(ctx.pathParam("hubId")) + "\"}");
-                return;
-            }
-            respondStage(ctx, id, stage);
+            if (stage == null) { jsonError(ctx, 404, "no stage for hub: " + raw); return; }
+            json(ctx, 200, stageJson(id, stage));
         });
 
-        // The state-change endpoint referenced by the integration contract.
-        // Stage 3 will publish to package-status-topic from here.
+        // 201 on first assignment, 200 on update — the correct code pair for
+        // an idempotent create-or-replace endpoint.
         app.post("/delay-stage/{hubId}", ctx -> {
-            String id = normalizeId(ctx.pathParam("hubId"));
-            if (id.isEmpty()) {
-                ctx.status(400);
-                ctx.contentType("application/json").result("{\"error\":\"hubId is required\"}");
-                return;
-            }
+            String raw = ctx.pathParam("hubId");
+            String id = normalizeId(raw);
+            if (id.isEmpty()) { jsonError(ctx, 400, "hubId is required"); return; }
+
             Integer stage = parseStage(ctx.body());
             if (stage == null) {
-                ctx.status(400);
-                ctx.contentType("application/json")
-                        .result("{\"error\":\"body must be {\\\"stage\\\": <int " + MIN_STAGE + "-" + MAX_STAGE + ">}\"}");
+                jsonError(ctx, 400, "body must be {\"stage\": <int " + MIN_STAGE + "-" + MAX_STAGE + ">}");
                 return;
             }
+
+            boolean existed = stages.containsKey(id);
             stages.put(id, stage);
-            LOG.info(() -> "hub " + id + " -> stage " + stage);
-            respondStage(ctx, id, stage);
+            LOG.info(() -> "hub " + id + " -> stage " + stage + (existed ? " (update)" : " (create)"));
+            json(ctx, existed ? 200 : 201, stageJson(id, stage));
         });
     }
 
-    private static void respondStage(io.javalin.http.Context ctx, String hubId, int stage) {
-        ctx.contentType("application/json")
-                .result("{\"hubId\":\"" + Json.escape(hubId) + "\",\"stage\":" + stage + "}");
+    // ── Response helpers ──────────────────────────────────────────────────
+
+    private static void json(Context ctx, int status, String body) {
+        ctx.status(status).contentType("application/json").result(body);
     }
+
+    private static void jsonError(Context ctx, int status, String msg) {
+        json(ctx, status, "{\"error\":\"" + Json.escape(msg) + "\",\"status\":" + status + "}");
+    }
+
+    private static String stageJson(String hubId, int stage) {
+        return "{\"hubId\":\"" + Json.escape(hubId) + "\",\"stage\":" + stage + "}";
+    }
+
+    // ── Parsing ───────────────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
     static Integer parseStage(String body) {
@@ -79,9 +94,7 @@ public class DelayStageServiceApp {
             else return null;
             if (n < MIN_STAGE || n > MAX_STAGE) return null;
             return n;
-        } catch (Exception e) {
-            return null;
-        }
+        } catch (Exception e) { return null; }
     }
 
     static String normalizeId(String s) {
