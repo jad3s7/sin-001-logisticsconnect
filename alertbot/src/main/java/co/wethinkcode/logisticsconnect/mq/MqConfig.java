@@ -1,15 +1,17 @@
 package co.wethinkcode.logisticsconnect.mq;
 
-/**
- * Shared by every producer/consumer service that talks to the "package-status-topic"
- * ActiveMQ topic. Duplicated into each participating service's own source tree,
- * since these are independent Maven projects with no shared parent pom.
- */
+/** Shared MQ config. Duplicated into each service per the brief's pattern. */
 public final class MqConfig {
 
-    public static final String BROKER_URL = "tcp://localhost:61616";
-    public static final String TOPIC = "package-status-topic";
+    public static final String BROKER_URL = env("MQ_BROKER_URL", "tcp://localhost:61616");
+    public static final String TOPIC      = env("MQ_TOPIC",      "package-status-topic");
+    public static final String USER       = env("MQ_USER",       "admin");
+    public static final String PASSWORD   = env("MQ_PASSWORD",   "admin");
 
-    private MqConfig() {
+    private static String env(String key, String def) {
+        String v = System.getenv(key);
+        return (v == null || v.isBlank()) ? def : v;
     }
+
+    private MqConfig() {}
 }
