@@ -2,13 +2,14 @@ package co.wethinkcode.logisticsconnect;
 
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * In-memory view of the last observed delay-stage for each hub, populated from
- * package-status-topic. Replaces transit-service's synchronous GET to
- * delay-stage-service (stage 2) with an MQ-driven read model.
+ * In-memory view of the last observed delay-stage per hub, populated from
+ * package-status-topic. This is the ONLY source of stage data in transit-service;
+ * there is no synchronous fallback to delay-stage-service.
  */
 public class StageCache {
 
@@ -25,6 +26,8 @@ public class StageCache {
     }
 
     public int size() { return entries.size(); }
+
+    public Map<String, Entry> snapshot() { return Map.copyOf(entries); }
 
     private static String normalize(String id) {
         return id == null ? "" : id.trim().replaceAll("\\s+", "").toUpperCase(Locale.ROOT);
