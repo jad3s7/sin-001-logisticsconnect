@@ -165,6 +165,7 @@ To add real tests to a module, add JUnit 5 and Surefire to its `pom.xml`:
   <scope>test</scope>
 </dependency>
 ```
+https://youtu.be/hjfE6sgSNvI
 
 ```xml
 <plugin>
